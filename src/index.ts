@@ -842,195 +842,249 @@ async function scrapeV3(facebookPageId: string, adLimit: number): Promise<Scrape
     if (collectedAds.length < limit && collectedAds.length <= 30) {
       console.log('[v3] Attempting direct API pagination...');
 
-      // Extract tokens and pagination state from the page
+      // Step A: Extract doc_id and fb_dtsg from CAPTURED GraphQL traffic
+      // (they're URL-encoded form params in every request body)
+      let trafficDocId: string | null = null;
+      let trafficDtsg: string | null = null;
+      let trafficLsd: string | null = null;
+      let adQueryDocId: string | null = null;
+
+      for (const traffic of graphqlTraffic) {
+        try {
+          const params = new URLSearchParams(traffic.reqBody);
+          const docId = params.get('doc_id');
+          const dtsg = params.get('fb_dtsg');
+          const lsd = params.get('lsd');
+          const vars = params.get('variables');
+
+          if (docId && !trafficDocId) trafficDocId = docId;
+          if (dtsg && !trafficDtsg) trafficDtsg = dtsg;
+          if (lsd && !trafficLsd) trafficLsd = lsd;
+
+          // Identify the ad search query by checking variables or response
+          if (vars && (vars.includes('viewAllPageID') || vars.includes('view_all_page_id'))) {
+            adQueryDocId = docId;
+            console.log(`[v3] Found ad query doc_id from variables: ${docId}`);
+          }
+          if (traffic.respSnippet.includes('ad_archive_id') || traffic.respSnippet.includes('library_id') || traffic.respSnippet.includes('forward_cursor')) {
+            if (docId) {
+              adQueryDocId = docId;
+              console.log(`[v3] Found ad query doc_id from response content: ${docId}`);
+            }
+          }
+        } catch {}
+      }
+
+      // Step B: Extract pagination cursor from page embedded data
       const pageState = await page.evaluate(() => {
-        const html = document.documentElement.innerHTML;
-
-        // Session tokens
-        const dtsgMatch = html.match(/"DTSGInitialData"[^}]*"token":"([^"]+)"/);
-        const lsdMatch = html.match(/"LSD"[^}]*"token":"([^"]+)"/);
-
-        // Relay/GraphQL state
         const allText = Array.from(document.querySelectorAll('script'))
           .map(s => s.textContent || '')
           .join('\n');
 
-        // Pagination cursors
         const fwdCursorMatch = allText.match(/"forward_cursor"\s*:\s*"([^"]+)"/);
         const endCursorMatch = allText.match(/"end_cursor"\s*:\s*"([^"]+)"/);
         const hasNextMatch = allText.match(/"has_next_page"\s*:\s*(true|false)/);
-
-        // Doc IDs used in queries
-        const docIds: string[] = [];
-        const docIdRegex = /"doc_id"\s*:\s*"(\d+)"/g;
-        let m;
-        while ((m = docIdRegex.exec(allText)) !== null) {
-          if (!docIds.includes(m[1])) docIds.push(m[1]);
-        }
-
-        // Session IDs
         const collationMatch = allText.match(/"collation_token"\s*:\s*"([^"]+)"/);
         const sessionMatch = allText.match(/"session_id"\s*:\s*"([^"]+)"/);
 
         return {
-          dtsg: dtsgMatch?.[1] || null,
-          lsd: lsdMatch?.[1] || null,
           forwardCursor: fwdCursorMatch?.[1] || null,
           endCursor: endCursorMatch?.[1] || null,
           hasNextPage: hasNextMatch?.[1] || null,
-          docIds,
           collationToken: collationMatch?.[1] || null,
           sessionId: sessionMatch?.[1] || null,
         };
       });
 
-      console.log('[v3] Page state:', JSON.stringify({
-        hasDtsg: !!pageState.dtsg,
-        hasLsd: !!pageState.lsd,
-        cursor: pageState.forwardCursor?.substring(0, 30) || pageState.endCursor?.substring(0, 30) || null,
-        hasNextPage: pageState.hasNextPage,
-        docIdCount: pageState.docIds.length,
-        docIds: pageState.docIds.slice(0, 5),
+      const cursor = pageState.forwardCursor || pageState.endCursor;
+      const finalDocId = adQueryDocId || trafficDocId;
+      const finalDtsg = trafficDtsg;
+
+      console.log('[v3] Token sources:', JSON.stringify({
+        fromTraffic: { docId: finalDocId, hasDtsg: !!finalDtsg, hasLsd: !!trafficLsd, capturedCalls: graphqlTraffic.length },
+        fromPage: { cursor: cursor?.substring(0, 30) || null, hasNextPage: pageState.hasNextPage },
       }));
 
-      diagnostics.push({ label: 'v3-page-state', ...pageState });
+      diagnostics.push({ label: 'v3-tokens', trafficDocId, adQueryDocId, hasDtsg: !!finalDtsg, hasLsd: !!trafficLsd, ...pageState });
       diagnostics.push({ label: 'v3-graphql-traffic', traffic: graphqlTraffic });
 
-      const cursor = pageState.forwardCursor || pageState.endCursor;
-
-      if (cursor && pageState.dtsg && pageState.docIds.length > 0) {
-        console.log(`[v3] Found cursor + tokens + ${pageState.docIds.length} doc_ids. Trying direct API...`);
+      if (cursor && finalDtsg && finalDocId) {
+        console.log(`[v3] All tokens found. Starting direct API pagination (doc_id=${finalDocId})...`);
 
         let currentCursor: string | null = cursor;
         let apiPage = 0;
+        const apiAds: ScrapedAd[] = [];
 
-        while (collectedAds.length < limit && currentCursor && apiPage < 50) {
+        while ((collectedAds.length + apiAds.length) < limit && currentCursor && apiPage < 50) {
           if (Date.now() - startTime > DEFAULT_TIMEOUT_MS) break;
           apiPage++;
 
-          // Try each doc_id until one works for ad library pagination
-          let succeeded = false;
-          for (const docId of pageState.docIds) {
-            if (succeeded) break;
+          console.log(`[v3] API page #${apiPage}, cursor: ${currentCursor.substring(0, 30)}..., total: ${collectedAds.length + apiAds.length}`);
 
-            const apiResult = await page.evaluate(
-              async ({ docId, cursor, pageId, dtsg, lsd, collationToken, sessionId }) => {
-                try {
-                  const variables = JSON.stringify({
-                    activeStatus: 'active',
-                    adType: 'ALL',
-                    bylines: [],
-                    collationToken: collationToken || '',
-                    contentLanguages: [],
-                    countries: ['ALL'],
-                    cursor: cursor,
-                    excludedIDs: [],
-                    first: 30,
-                    mediaType: 'ALL',
-                    pageIDs: [],
-                    potentialReachInput: [],
-                    publisherPlatforms: [],
-                    queryString: '',
-                    regions: [],
-                    searchType: 'page',
-                    sessionID: sessionId || '',
-                    sortData: { mode: 'TOTAL_IMPRESSIONS', direction: 'DESCENDING' },
-                    source: null,
-                    startDate: null,
-                    v: 'default',
-                    viewAllPageID: pageId,
-                  });
-
-                  const params = new URLSearchParams();
-                  params.append('doc_id', docId);
-                  params.append('variables', variables);
-                  params.append('fb_dtsg', dtsg);
-                  if (lsd) params.append('lsd', lsd);
-
-                  const resp = await fetch('/api/graphql/', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: params.toString(),
-                    credentials: 'include',
-                  });
-
-                  const text = await resp.text();
-                  return { ok: true, status: resp.status, body: text.substring(0, 10000) };
-                } catch (e) {
-                  return { ok: false, status: 0, body: String(e) };
-                }
-              },
-              {
-                docId,
-                cursor: currentCursor,
-                pageId: facebookPageId,
-                dtsg: pageState.dtsg!,
-                lsd: pageState.lsd,
-                collationToken: pageState.collationToken,
-                sessionId: pageState.sessionId,
-              }
-            );
-
-            if (apiResult.ok && apiResult.status === 200 && apiResult.body.length > 100) {
-              console.log(`[v3] API page #${apiPage} (doc_id=${docId}): ${apiResult.status}, ${apiResult.body.length} chars`);
-
-              // Try to parse and find ad data + next cursor
+          const apiResult: { ok: boolean; status: number; body: string } = await page.evaluate(
+            async ({ docId, cursor, pageId, dtsg, lsd, collationToken, sessionId }) => {
               try {
-                const jsonText = apiResult.body.replace(/^for \(;;\);/, '');
-                const parsed = JSON.parse(jsonText);
-                const bodyStr = JSON.stringify(parsed);
-
-                // Look for next cursor
-                const nextCursorMatch = bodyStr.match(/"forward_cursor"\s*:\s*"([^"]+)"/);
-                const nextEndCursorMatch = bodyStr.match(/"end_cursor"\s*:\s*"([^"]+)"/);
-                const nextCursor = nextCursorMatch?.[1] || nextEndCursorMatch?.[1] || null;
-
-                // Check if this response contains ad data (look for library_id pattern)
-                const hasAdData = bodyStr.includes('library_id') || bodyStr.includes('ad_archive_id');
-
-                if (hasAdData) {
-                  console.log(`[v3] Doc ID ${docId} contains ad data! Next cursor: ${nextCursor ? 'yes' : 'no'}`);
-                  diagnostics.push({
-                    label: `v3-api-page-${apiPage}`,
-                    docId,
-                    responseLength: apiResult.body.length,
-                    hasAdData,
-                    hasNextCursor: !!nextCursor,
-                    snippet: apiResult.body.substring(0, 2000),
-                  });
-                  currentCursor = nextCursor;
-                  succeeded = true;
-                } else {
-                  console.log(`[v3] Doc ID ${docId}: no ad data in response`);
-                }
-              } catch {
-                console.log(`[v3] Doc ID ${docId}: failed to parse response`);
-                diagnostics.push({
-                  label: `v3-api-parse-fail-${apiPage}`,
-                  docId,
-                  snippet: apiResult.body.substring(0, 1000),
+                const variables = JSON.stringify({
+                  activeStatus: 'active',
+                  adType: 'ALL',
+                  bylines: [],
+                  collationToken: collationToken || '',
+                  contentLanguages: [],
+                  countries: ['ALL'],
+                  cursor: cursor,
+                  excludedIDs: [],
+                  first: 30,
+                  mediaType: 'ALL',
+                  pageIDs: [],
+                  potentialReachInput: [],
+                  publisherPlatforms: [],
+                  queryString: '',
+                  regions: [],
+                  searchType: 'page',
+                  sessionID: sessionId || '',
+                  sortData: { mode: 'TOTAL_IMPRESSIONS', direction: 'DESCENDING' },
+                  source: null,
+                  startDate: null,
+                  v: 'default',
+                  viewAllPageID: pageId,
                 });
+
+                const params = new URLSearchParams();
+                params.append('doc_id', docId);
+                params.append('variables', variables);
+                params.append('fb_dtsg', dtsg);
+                if (lsd) params.append('lsd', lsd);
+
+                const resp = await fetch('/api/graphql/', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                  body: params.toString(),
+                  credentials: 'include',
+                });
+
+                const text = await resp.text();
+                return { ok: true, status: resp.status, body: text };
+              } catch (e) {
+                return { ok: false, status: 0, body: String(e) };
               }
+            },
+            {
+              docId: finalDocId,
+              cursor: currentCursor,
+              pageId: facebookPageId,
+              dtsg: finalDtsg,
+              lsd: trafficLsd,
+              collationToken: pageState.collationToken,
+              sessionId: pageState.sessionId,
             }
+          );
+
+          if (!apiResult.ok || apiResult.status !== 200) {
+            console.log(`[v3] API call failed: status=${apiResult.status}`);
+            diagnostics.push({ label: `v3-api-fail-${apiPage}`, status: apiResult.status, snippet: apiResult.body.substring(0, 1000) });
+            break;
           }
 
-          if (!succeeded) {
-            console.log('[v3] No doc_id returned ad data. Stopping API pagination.');
+          console.log(`[v3] API page #${apiPage}: ${apiResult.status}, ${apiResult.body.length} chars`);
+
+          try {
+            // Facebook prefixes responses with "for (;;);" to prevent JSON hijacking
+            const jsonText = apiResult.body.replace(/^for \(;;\);/, '');
+            const bodyStr = jsonText;
+
+            // Extract next cursor
+            const nextFwdMatch = bodyStr.match(/"forward_cursor"\s*:\s*"([^"]+)"/);
+            const nextEndMatch = bodyStr.match(/"end_cursor"\s*:\s*"([^"]+)"/);
+            const nextCursor = nextFwdMatch?.[1] || nextEndMatch?.[1] || null;
+            const hasAdData = bodyStr.includes('ad_archive_id') || bodyStr.includes('library_id');
+
+            console.log(`[v3] API page #${apiPage}: hasAdData=${hasAdData}, nextCursor=${nextCursor ? 'yes' : 'no'}`);
+
+            if (hasAdData) {
+              // Extract ad IDs from the response (library_id / ad_archive_id)
+              const idMatches = [...bodyStr.matchAll(/"(?:ad_archive_id|library_id)"\s*:\s*"?(\d+)"?/g)];
+              const uniqueIds = [...new Set(idMatches.map(m => m[1]))];
+
+              // Extract ad nodes as best-effort from the JSON
+              for (const adId of uniqueIds) {
+                // Skip if we already have this ad
+                if (collectedAds.some(a => a.libraryId === adId) || apiAds.some(a => a.libraryId === adId)) continue;
+
+                // Extract what we can from the JSON near this ad ID
+                const adRegion = bodyStr.substring(
+                  Math.max(0, bodyStr.indexOf(adId) - 500),
+                  Math.min(bodyStr.length, bodyStr.indexOf(adId) + 2000)
+                );
+
+                // Start date
+                const startMatch = adRegion.match(/"start_date"\s*:\s*(\d+)/);
+                let startDate: string | null = null;
+                if (startMatch) {
+                  const d = new Date(parseInt(startMatch[1]) * 1000);
+                  startDate = `${d.getDate()} ${d.toLocaleString('en-US', { month: 'short' })} ${d.getFullYear()}`;
+                }
+
+                // Snapshot/image URL
+                const snapshotMatch = adRegion.match(/"snapshot_url"\s*:\s*"([^"]+)"/);
+                const imageMatch = adRegion.match(/"resized_image_url"\s*:\s*"([^"]+)"/) || adRegion.match(/"original_image_url"\s*:\s*"([^"]+)"/);
+                const videoMatch = adRegion.match(/"video_hd_url"\s*:\s*"([^"]+)"/) || adRegion.match(/"video_sd_url"\s*:\s*"([^"]+)"/);
+
+                const hasVideo = !!videoMatch;
+                const assetUrl = hasVideo
+                  ? videoMatch![1].replace(/\\\//g, '/')
+                  : (imageMatch?.[1] || snapshotMatch?.[1] || '').replace(/\\\//g, '/') || null;
+
+                apiAds.push({
+                  libraryId: adId,
+                  assetType: hasVideo ? 'video' : 'image',
+                  assetUrl,
+                  thumbnailUrl: null,
+                  startDate,
+                  endDate: null,
+                  lowImpressionCount: false,
+                  impressions: null,
+                });
+              }
+
+              console.log(`[v3] Extracted ${uniqueIds.length} ads from API page #${apiPage} (${apiAds.length} total API ads)`);
+            } else {
+              console.log(`[v3] API page #${apiPage}: no ad data found`);
+              diagnostics.push({ label: `v3-api-no-data-${apiPage}`, snippet: apiResult.body.substring(0, 2000) });
+              break;
+            }
+
+            if (!nextCursor) {
+              console.log('[v3] No next cursor — reached end of results');
+              break;
+            }
+            currentCursor = nextCursor;
+
+            // Small delay between API calls
+            await page.waitForTimeout(1000 + Math.floor(Math.random() * 1000));
+          } catch (e) {
+            console.log(`[v3] Failed to parse API response: ${e}`);
+            diagnostics.push({ label: `v3-api-parse-fail-${apiPage}`, snippet: apiResult.body.substring(0, 2000) });
             break;
           }
         }
+
+        if (apiAds.length > 0) {
+          console.log(`[v3] API pagination collected ${apiAds.length} additional ads`);
+          collectedAds = [...collectedAds, ...apiAds];
+        }
       } else {
-        console.log('[v3] Missing cursor/tokens for API approach');
+        console.log('[v3] Missing tokens for API approach:', {
+          hasCursor: !!cursor,
+          hasDtsg: !!finalDtsg,
+          hasDocId: !!finalDocId,
+        });
         diagnostics.push({
           label: 'v3-missing-tokens',
-          hasDtsg: !!pageState.dtsg,
           hasCursor: !!cursor,
-          docIdCount: pageState.docIds.length,
+          hasDtsg: !!finalDtsg,
+          hasDocId: !!finalDocId,
         });
       }
-
-      // Re-extract from DOM in case the API calls injected content
-      collectedAds = await extractAdsFromDom(page);
     }
 
     const ads = collectedAds.slice(0, limit);
