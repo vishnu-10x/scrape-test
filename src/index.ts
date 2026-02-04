@@ -269,6 +269,21 @@ async function scrape(facebookPageId: string, adLimit: number): Promise<ScrapeRe
       const preScrollPos = await page.evaluate(() => window.scrollY);
 
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+
+      // Click "See more" button if Facebook is gating infinite scroll behind it
+      try {
+        const seeMoreBtn = page.locator(
+          'button:has-text("See more"), [role="button"]:has-text("See more")'
+        ).first();
+        if (await seeMoreBtn.isVisible({ timeout: 500 })) {
+          await seeMoreBtn.click();
+          console.log(`[scraper] Clicked "See more" button on scroll #${scrollIteration}`);
+          await page.waitForTimeout(1_000);
+        }
+      } catch {
+        // Button not present
+      }
+
       await page.waitForTimeout(SCROLL_DELAY_MS);
 
       const postScrollHeight = await page.evaluate(() => document.body.scrollHeight);
