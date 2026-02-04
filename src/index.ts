@@ -651,6 +651,429 @@ async function scrapeV2(facebookPageId: string, adLimit: number): Promise<Scrape
   }
 }
 
+// --- V3 Scraper: hydration-aware + GraphQL capture + direct API fallback ---
+
+interface GraphQLCapture {
+  reqBody: string;
+  respSnippet: string;
+  status: number;
+}
+
+async function scrapeV3(facebookPageId: string, adLimit: number): Promise<ScrapeResult> {
+  const startTime = Date.now();
+  const limit = Math.max(MIN_ADS, Math.min(MAX_ADS, adLimit));
+  const url = buildUrl(facebookPageId);
+  const diagnostics: Record<string, unknown>[] = [];
+  const blockedRequests: string[] = [];
+  const consoleErrors: string[] = [];
+  const pageErrors: string[] = [];
+  const graphqlTraffic: GraphQLCapture[] = [];
+
+  console.log(`[v3] Starting scrape for ${facebookPageId} (limit: ${limit})`);
+
+  let browser: Browser | null = null;
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-features=VizDisplayCompositor',
+        '--disable-blink-features=AutomationControlled',
+        '--window-size=1440,900',
+      ],
+    });
+
+    const context = await browser.newContext({
+      locale: 'en-US',
+      viewport: { width: 1440, height: 900 },
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      extraHTTPHeaders: {
+        'Accept-Language': 'en-US,en;q=0.9',
+        'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Linux"',
+      },
+    });
+
+    const page = await context.newPage();
+    await applyStealthScripts(page);
+
+    page.on('console', msg => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+
+    // Capture uncaught JS exceptions (not just console.error)
+    page.on('pageerror', err => {
+      pageErrors.push(err.message);
+    });
+
+    page.on('response', resp => {
+      if (resp.status() === 403) blockedRequests.push(`403: ${resp.url().substring(0, 200)}`);
+    });
+
+    // Capture GraphQL traffic with request + response bodies
+    page.on('response', async (resp) => {
+      if (resp.url().includes('/api/graphql')) {
+        try {
+          const reqBody = resp.request().postData() || '';
+          const respBody = await resp.text();
+          graphqlTraffic.push({
+            reqBody: reqBody.substring(0, 3000),
+            respSnippet: respBody.substring(0, 3000),
+            status: resp.status(),
+          });
+          console.log(`[v3] GraphQL captured (${resp.status()}): ${reqBody.substring(0, 80)}...`);
+        } catch {}
+      }
+    });
+
+    // Phase 1: Navigate with networkidle
+    console.log('[v3] Navigating (networkidle)...');
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 60_000 });
+    await dismissCookieConsent(page);
+
+    // Phase 2: Wait for FULL React hydration — poll until ads rendered AND spinner gone
+    console.log('[v3] Waiting for React hydration...');
+    const adSelector = 'div.x1plvlek.xryxfnj.x1gzqxud.x178xt8z.x1lun4ml';
+    let hydrated = false;
+
+    for (let i = 0; i < 30; i++) {
+      const state = await page.evaluate(() => {
+        const ads = document.querySelectorAll('div.x1plvlek.xryxfnj.x1gzqxud.x178xt8z.x1lun4ml');
+        const allDivs = Array.from(document.querySelectorAll('div'));
+        const hasSpinner = allDivs.some(d =>
+          d.getAttribute('role') === 'progressbar' || d.className.includes('loading')
+        );
+        return { adCount: ads.length, hasSpinner };
+      });
+
+      if (i % 5 === 0 || (state.adCount > 0 && !state.hasSpinner)) {
+        console.log(`[v3] Hydration check #${i}: ${state.adCount} ads, spinner: ${state.hasSpinner}`);
+      }
+
+      if (state.adCount > 0 && !state.hasSpinner) {
+        console.log('[v3] Hydration complete');
+        hydrated = true;
+        break;
+      }
+
+      await page.waitForTimeout(2_000);
+    }
+
+    if (!hydrated) {
+      console.warn('[v3] Hydration did not complete within 60s, continuing anyway');
+    }
+
+    // Phase 3: Extra settle time for scroll event handlers to attach
+    await page.waitForTimeout(3_000);
+
+    diagnostics.push(await collectPageDiagnostics(page, 'v3-after-hydration'));
+
+    const advertiserName = await extractAdvertiserName(page);
+    if (advertiserName) console.log(`[v3] Advertiser: "${advertiserName}"`);
+
+    // Phase 4: Scroll loop with GraphQL monitoring
+    let collectedAds = await extractAdsFromDom(page);
+    console.log(`[v3] Initial extraction: ${collectedAds.length} ads`);
+
+    let staleScrollCount = 0;
+    let previousAdCount = collectedAds.length;
+    let scrollIteration = 0;
+
+    while (collectedAds.length < limit) {
+      if (Date.now() - startTime > DEFAULT_TIMEOUT_MS) {
+        console.warn(`[v3] Timeout at ${collectedAds.length} ads`);
+        break;
+      }
+
+      scrollIteration++;
+      const gqlBefore = graphqlTraffic.length;
+
+      // Scroll to bottom (same as v1 which works locally)
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+
+      // Click "See more" if visible
+      try {
+        const btn = page.locator(
+          'button:has-text("See more"), [role="button"]:has-text("See more")'
+        ).first();
+        if (await btn.isVisible({ timeout: 500 })) {
+          await btn.click();
+          console.log(`[v3] Clicked See more on scroll #${scrollIteration}`);
+          await page.waitForTimeout(2_000);
+        }
+      } catch {}
+
+      await page.waitForTimeout(SCROLL_DELAY_MS);
+
+      const gqlAfter = graphqlTraffic.length;
+      collectedAds = await extractAdsFromDom(page);
+
+      console.log(
+        `[v3] Scroll #${scrollIteration}: ${collectedAds.length} ads (prev: ${previousAdCount}, stale: ${staleScrollCount}/${MAX_STALE_SCROLLS}) | gql: +${gqlAfter - gqlBefore}`
+      );
+
+      if (collectedAds.length === previousAdCount) {
+        staleScrollCount++;
+        if (staleScrollCount === 1) {
+          diagnostics.push(await collectPageDiagnostics(page, 'v3-first-stale'));
+        }
+        // After 3 stale scrolls, switch to direct API approach
+        if (staleScrollCount >= 3 && collectedAds.length <= 30) {
+          console.log('[v3] Scroll stuck early. Switching to direct API approach...');
+          break;
+        }
+        if (staleScrollCount >= MAX_STALE_SCROLLS) {
+          console.log(`[v3] Stopping: ${MAX_STALE_SCROLLS} stale scrolls at ${collectedAds.length} ads`);
+          break;
+        }
+      } else {
+        staleScrollCount = 0;
+      }
+
+      previousAdCount = collectedAds.length;
+    }
+
+    // Phase 5: If stuck, try direct GraphQL API pagination
+    if (collectedAds.length < limit && collectedAds.length <= 30) {
+      console.log('[v3] Attempting direct API pagination...');
+
+      // Extract tokens and pagination state from the page
+      const pageState = await page.evaluate(() => {
+        const html = document.documentElement.innerHTML;
+
+        // Session tokens
+        const dtsgMatch = html.match(/"DTSGInitialData"[^}]*"token":"([^"]+)"/);
+        const lsdMatch = html.match(/"LSD"[^}]*"token":"([^"]+)"/);
+
+        // Relay/GraphQL state
+        const allText = Array.from(document.querySelectorAll('script'))
+          .map(s => s.textContent || '')
+          .join('\n');
+
+        // Pagination cursors
+        const fwdCursorMatch = allText.match(/"forward_cursor"\s*:\s*"([^"]+)"/);
+        const endCursorMatch = allText.match(/"end_cursor"\s*:\s*"([^"]+)"/);
+        const hasNextMatch = allText.match(/"has_next_page"\s*:\s*(true|false)/);
+
+        // Doc IDs used in queries
+        const docIds: string[] = [];
+        const docIdRegex = /"doc_id"\s*:\s*"(\d+)"/g;
+        let m;
+        while ((m = docIdRegex.exec(allText)) !== null) {
+          if (!docIds.includes(m[1])) docIds.push(m[1]);
+        }
+
+        // Session IDs
+        const collationMatch = allText.match(/"collation_token"\s*:\s*"([^"]+)"/);
+        const sessionMatch = allText.match(/"session_id"\s*:\s*"([^"]+)"/);
+
+        return {
+          dtsg: dtsgMatch?.[1] || null,
+          lsd: lsdMatch?.[1] || null,
+          forwardCursor: fwdCursorMatch?.[1] || null,
+          endCursor: endCursorMatch?.[1] || null,
+          hasNextPage: hasNextMatch?.[1] || null,
+          docIds,
+          collationToken: collationMatch?.[1] || null,
+          sessionId: sessionMatch?.[1] || null,
+        };
+      });
+
+      console.log('[v3] Page state:', JSON.stringify({
+        hasDtsg: !!pageState.dtsg,
+        hasLsd: !!pageState.lsd,
+        cursor: pageState.forwardCursor?.substring(0, 30) || pageState.endCursor?.substring(0, 30) || null,
+        hasNextPage: pageState.hasNextPage,
+        docIdCount: pageState.docIds.length,
+        docIds: pageState.docIds.slice(0, 5),
+      }));
+
+      diagnostics.push({ label: 'v3-page-state', ...pageState });
+      diagnostics.push({ label: 'v3-graphql-traffic', traffic: graphqlTraffic });
+
+      const cursor = pageState.forwardCursor || pageState.endCursor;
+
+      if (cursor && pageState.dtsg && pageState.docIds.length > 0) {
+        console.log(`[v3] Found cursor + tokens + ${pageState.docIds.length} doc_ids. Trying direct API...`);
+
+        let currentCursor: string | null = cursor;
+        let apiPage = 0;
+
+        while (collectedAds.length < limit && currentCursor && apiPage < 50) {
+          if (Date.now() - startTime > DEFAULT_TIMEOUT_MS) break;
+          apiPage++;
+
+          // Try each doc_id until one works for ad library pagination
+          let succeeded = false;
+          for (const docId of pageState.docIds) {
+            if (succeeded) break;
+
+            const apiResult = await page.evaluate(
+              async ({ docId, cursor, pageId, dtsg, lsd, collationToken, sessionId }) => {
+                try {
+                  const variables = JSON.stringify({
+                    activeStatus: 'active',
+                    adType: 'ALL',
+                    bylines: [],
+                    collationToken: collationToken || '',
+                    contentLanguages: [],
+                    countries: ['ALL'],
+                    cursor: cursor,
+                    excludedIDs: [],
+                    first: 30,
+                    mediaType: 'ALL',
+                    pageIDs: [],
+                    potentialReachInput: [],
+                    publisherPlatforms: [],
+                    queryString: '',
+                    regions: [],
+                    searchType: 'page',
+                    sessionID: sessionId || '',
+                    sortData: { mode: 'TOTAL_IMPRESSIONS', direction: 'DESCENDING' },
+                    source: null,
+                    startDate: null,
+                    v: 'default',
+                    viewAllPageID: pageId,
+                  });
+
+                  const params = new URLSearchParams();
+                  params.append('doc_id', docId);
+                  params.append('variables', variables);
+                  params.append('fb_dtsg', dtsg);
+                  if (lsd) params.append('lsd', lsd);
+
+                  const resp = await fetch('/api/graphql/', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: params.toString(),
+                    credentials: 'include',
+                  });
+
+                  const text = await resp.text();
+                  return { ok: true, status: resp.status, body: text.substring(0, 10000) };
+                } catch (e) {
+                  return { ok: false, status: 0, body: String(e) };
+                }
+              },
+              {
+                docId,
+                cursor: currentCursor,
+                pageId: facebookPageId,
+                dtsg: pageState.dtsg!,
+                lsd: pageState.lsd,
+                collationToken: pageState.collationToken,
+                sessionId: pageState.sessionId,
+              }
+            );
+
+            if (apiResult.ok && apiResult.status === 200 && apiResult.body.length > 100) {
+              console.log(`[v3] API page #${apiPage} (doc_id=${docId}): ${apiResult.status}, ${apiResult.body.length} chars`);
+
+              // Try to parse and find ad data + next cursor
+              try {
+                const jsonText = apiResult.body.replace(/^for \(;;\);/, '');
+                const parsed = JSON.parse(jsonText);
+                const bodyStr = JSON.stringify(parsed);
+
+                // Look for next cursor
+                const nextCursorMatch = bodyStr.match(/"forward_cursor"\s*:\s*"([^"]+)"/);
+                const nextEndCursorMatch = bodyStr.match(/"end_cursor"\s*:\s*"([^"]+)"/);
+                const nextCursor = nextCursorMatch?.[1] || nextEndCursorMatch?.[1] || null;
+
+                // Check if this response contains ad data (look for library_id pattern)
+                const hasAdData = bodyStr.includes('library_id') || bodyStr.includes('ad_archive_id');
+
+                if (hasAdData) {
+                  console.log(`[v3] Doc ID ${docId} contains ad data! Next cursor: ${nextCursor ? 'yes' : 'no'}`);
+                  diagnostics.push({
+                    label: `v3-api-page-${apiPage}`,
+                    docId,
+                    responseLength: apiResult.body.length,
+                    hasAdData,
+                    hasNextCursor: !!nextCursor,
+                    snippet: apiResult.body.substring(0, 2000),
+                  });
+                  currentCursor = nextCursor;
+                  succeeded = true;
+                } else {
+                  console.log(`[v3] Doc ID ${docId}: no ad data in response`);
+                }
+              } catch {
+                console.log(`[v3] Doc ID ${docId}: failed to parse response`);
+                diagnostics.push({
+                  label: `v3-api-parse-fail-${apiPage}`,
+                  docId,
+                  snippet: apiResult.body.substring(0, 1000),
+                });
+              }
+            }
+          }
+
+          if (!succeeded) {
+            console.log('[v3] No doc_id returned ad data. Stopping API pagination.');
+            break;
+          }
+        }
+      } else {
+        console.log('[v3] Missing cursor/tokens for API approach');
+        diagnostics.push({
+          label: 'v3-missing-tokens',
+          hasDtsg: !!pageState.dtsg,
+          hasCursor: !!cursor,
+          docIdCount: pageState.docIds.length,
+        });
+      }
+
+      // Re-extract from DOM in case the API calls injected content
+      collectedAds = await extractAdsFromDom(page);
+    }
+
+    const ads = collectedAds.slice(0, limit);
+    diagnostics.push(await collectPageDiagnostics(page, 'v3-complete'));
+
+    if (pageErrors.length > 0) {
+      console.warn('[v3] Page errors:', pageErrors);
+      diagnostics.push({ label: 'v3-page-errors', errors: pageErrors });
+    }
+
+    console.log(`[v3] Done: ${ads.length} ads, ${graphqlTraffic.length} GraphQL calls captured`);
+    if (blockedRequests.length > 0) console.warn('[v3] Blocked:', blockedRequests);
+
+    return {
+      success: true,
+      ads,
+      totalFound: ads.length,
+      errors: [],
+      durationMs: Date.now() - startTime,
+      advertiserName,
+      diagnostics,
+      blockedRequests,
+      consoleErrors,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[v3] Failed: ${message}`);
+    return {
+      success: false,
+      ads: [],
+      totalFound: 0,
+      errors: [message],
+      durationMs: Date.now() - startTime,
+      advertiserName: null,
+      diagnostics,
+      blockedRequests,
+      consoleErrors,
+    };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
 // --- Diagnose ---
 
 async function diagnose(facebookPageId: string): Promise<Record<string, unknown>> {
@@ -734,6 +1157,12 @@ async function diagnose(facebookPageId: string): Promise<Record<string, unknown>
     );
     const postScrollHeight = await page.evaluate(() => document.body.scrollHeight);
 
+    // Verdict: only count as "working" if we got ads BEYOND the initial SSR batch (~21).
+    // Going from 0→21 is just the SSR content finishing its render, not infinite scroll.
+    const scrollTrulyLoaded = preScrollAds > 0
+      ? postScrollAds > preScrollAds       // Had ads before scroll, got more after
+      : postScrollAds > 25;                // Had 0 ads, need to exceed SSR batch (~21) to count
+
     const scrollTest = {
       preScrollAds,
       postScrollAds,
@@ -741,7 +1170,7 @@ async function diagnose(facebookPageId: string): Promise<Record<string, unknown>
       postScrollHeight,
       newAdsLoaded: postScrollAds - preScrollAds,
       heightGrew: postScrollHeight > preScrollHeight,
-      verdict: postScrollAds > preScrollAds ? 'INFINITE_SCROLL_WORKING' : 'INFINITE_SCROLL_BROKEN',
+      verdict: scrollTrulyLoaded ? 'INFINITE_SCROLL_WORKING' : 'INFINITE_SCROLL_BROKEN',
     };
     console.log('[diagnose] Scroll test:', JSON.stringify(scrollTest));
 
@@ -822,6 +1251,21 @@ app.post('/scrape-v2', async (req, res) => {
 
   try {
     const result = await scrapeV2(facebookPageId, adLimit ?? DEFAULT_ADS);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+app.post('/scrape-v3', async (req, res) => {
+  const { facebookPageId, adLimit } = req.body;
+  if (!facebookPageId || typeof facebookPageId !== 'string') {
+    res.status(400).json({ error: 'facebookPageId is required' });
+    return;
+  }
+
+  try {
+    const result = await scrapeV3(facebookPageId, adLimit ?? DEFAULT_ADS);
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: String(err) });
