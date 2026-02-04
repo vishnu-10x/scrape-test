@@ -382,6 +382,398 @@ async function takeScreenshot(facebookPageId: string): Promise<{ screenshot: str
   }
 }
 
+// --- Enhanced Stealth ---
+
+async function applyStealthScripts(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    // Navigator core properties
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'platform', { get: () => 'Linux x86_64' });
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+    Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+
+    // Fake plugins (headless has zero — dead giveaway)
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => {
+        const arr = [
+          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
+          { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '', length: 1 },
+          { name: 'Native Client', filename: 'internal-nacl-plugin', description: '', length: 1 },
+        ];
+        return Object.assign(arr, {
+          namedItem: (name: string) => arr.find(p => p.name === name) || null,
+          refresh: () => {},
+        });
+      },
+    });
+
+    // Chrome runtime stub (missing in headless = detected)
+    const w = window as any;
+    w.chrome = {
+      runtime: { connect: () => {}, sendMessage: () => {}, id: undefined },
+      loadTimes: () => ({}),
+      csi: () => ({}),
+    };
+
+    // Permissions API override
+    const origQuery = navigator.permissions.query.bind(navigator.permissions);
+    navigator.permissions.query = (params: any) =>
+      params.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission } as PermissionStatus)
+        : origQuery(params);
+
+    // WebGL — override SwiftShader (headless giveaway) with real GPU strings
+    const getParam = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function (p: number) {
+      if (p === 37445) return 'Intel Inc.';
+      if (p === 37446) return 'Intel Iris OpenGL Engine';
+      return getParam.call(this, p);
+    };
+    const getParam2 = WebGL2RenderingContext.prototype.getParameter;
+    WebGL2RenderingContext.prototype.getParameter = function (p: number) {
+      if (p === 37445) return 'Intel Inc.';
+      if (p === 37446) return 'Intel Iris OpenGL Engine';
+      return getParam2.call(this, p);
+    };
+
+    // Network connection info (missing in some headless envs)
+    Object.defineProperty(navigator, 'connection', {
+      get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false }),
+    });
+  });
+}
+
+// --- V2 Scraper ---
+
+interface NetworkEntry {
+  url: string;
+  status: number;
+  method: string;
+  type: string;
+}
+
+async function scrapeV2(facebookPageId: string, adLimit: number): Promise<ScrapeResult> {
+  const startTime = Date.now();
+  const limit = Math.max(MIN_ADS, Math.min(MAX_ADS, adLimit));
+  const url = buildUrl(facebookPageId);
+  const diagnostics: Record<string, unknown>[] = [];
+  const blockedRequests: string[] = [];
+  const consoleErrors: string[] = [];
+  const networkLog: NetworkEntry[] = [];
+
+  console.log(`[v2] Starting scrape for ${facebookPageId} (limit: ${limit})`);
+
+  let browser: Browser | null = null;
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-features=VizDisplayCompositor',
+        '--disable-blink-features=AutomationControlled',
+        '--window-size=1440,900',
+      ],
+    });
+
+    const context = await browser.newContext({
+      locale: 'en-US',
+      viewport: { width: 1440, height: 900 },
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      extraHTTPHeaders: {
+        'Accept-Language': 'en-US,en;q=0.9',
+        'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Linux"',
+      },
+    });
+
+    const page = await context.newPage();
+    await applyStealthScripts(page);
+
+    page.on('console', msg => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+
+    page.on('response', resp => {
+      const u = resp.url();
+      const status = resp.status();
+      if (status === 403) blockedRequests.push(`403: ${u.substring(0, 200)}`);
+      // Track Facebook API calls — these are the requests that load more ads
+      if (u.includes('/api/graphql') || u.includes('/ajax/') || u.includes('ads_library')) {
+        networkLog.push({
+          url: u.substring(0, 200),
+          status,
+          method: resp.request().method(),
+          type: resp.request().resourceType(),
+        });
+      }
+    });
+
+    // Phase 1: Full page load — networkidle waits for all JS bundles to download + execute
+    console.log('[v2] Navigating (networkidle)...');
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 60_000 });
+    await dismissCookieConsent(page);
+
+    // Phase 2: Wait for ad containers with extended timeout
+    const adSelector = 'div.x1plvlek.xryxfnj.x1gzqxud.x178xt8z.x1lun4ml';
+    try {
+      await page.waitForSelector(adSelector, { timeout: 30_000 });
+      console.log('[v2] Ad containers detected');
+    } catch {
+      console.warn('[v2] Ad containers did not appear within 30s');
+    }
+
+    // Phase 3: Extra settle time for Facebook's JS to attach scroll handlers
+    await page.waitForTimeout(5_000);
+
+    diagnostics.push(await collectPageDiagnostics(page, 'v2-after-load'));
+    diagnostics.push({ label: 'v2-initial-network', requests: [...networkLog] });
+
+    const jsState = await page.evaluate(() => {
+      const scripts = Array.from(document.querySelectorAll('script[src]'));
+      return {
+        scriptCount: scripts.length,
+        hasFbJs: scripts.some(s => (s.getAttribute('src') || '').includes('rsrc.php')),
+        bodyClasses: document.body.className.substring(0, 200),
+      };
+    });
+    console.log('[v2] JS state:', JSON.stringify(jsState));
+    diagnostics.push({ label: 'v2-js-state', ...jsState });
+
+    const advertiserName = await extractAdvertiserName(page);
+    if (advertiserName) console.log(`[v2] Advertiser: "${advertiserName}"`);
+
+    // Phase 4: Scroll loop — incremental smooth scrolling instead of jumping to bottom
+    let collectedAds: ScrapedAd[] = [];
+    let staleScrollCount = 0;
+    let previousAdCount = 0;
+    let scrollIteration = 0;
+
+    while (collectedAds.length < limit) {
+      if (Date.now() - startTime > DEFAULT_TIMEOUT_MS) {
+        console.warn(`[v2] Timeout reached with ${collectedAds.length} ads`);
+        break;
+      }
+
+      scrollIteration++;
+      const netCountBefore = networkLog.length;
+
+      // Smooth scroll by ~2 viewport heights (more human-like, triggers IntersectionObserver)
+      const vh = await page.evaluate(() => window.innerHeight);
+      const prePos = await page.evaluate(() => window.scrollY);
+      const preHeight = await page.evaluate(() => document.body.scrollHeight);
+      const target = Math.min(prePos + vh * 2, preHeight);
+
+      await page.evaluate((t) => window.scrollTo({ top: t, behavior: 'smooth' }), target);
+
+      // Randomized delay (2.5–5s) to mimic human reading
+      const delay = 2500 + Math.floor(Math.random() * 2500);
+      await page.waitForTimeout(delay);
+
+      // If near the bottom, wait extra for lazy-loaded content then scroll to absolute end
+      const nearBottom = await page.evaluate(() =>
+        document.body.scrollHeight - window.scrollY - window.innerHeight < 300
+      );
+      if (nearBottom) {
+        await page.waitForTimeout(2_000);
+        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+        await page.waitForTimeout(1_000);
+      }
+
+      const postHeight = await page.evaluate(() => document.body.scrollHeight);
+      const postPos = await page.evaluate(() => window.scrollY);
+      const netCountAfter = networkLog.length;
+
+      collectedAds = await extractAdsFromDom(page);
+
+      console.log(
+        `[v2] Scroll #${scrollIteration}: ${collectedAds.length} ads (prev: ${previousAdCount}, stale: ${staleScrollCount}/${MAX_STALE_SCROLLS}) | ` +
+        `height: ${preHeight}->${postHeight}, pos: ${prePos}->${postPos}, net: +${netCountAfter - netCountBefore}`
+      );
+
+      if (collectedAds.length === previousAdCount) {
+        staleScrollCount++;
+        if (staleScrollCount === 1) {
+          diagnostics.push(await collectPageDiagnostics(page, 'v2-first-stale'));
+          diagnostics.push({ label: 'v2-stale-network', recentRequests: networkLog.slice(-5) });
+        }
+        if (staleScrollCount >= MAX_STALE_SCROLLS) {
+          console.log(`[v2] Stopping: ${MAX_STALE_SCROLLS} stale scrolls at ${collectedAds.length} ads`);
+          break;
+        }
+      } else {
+        staleScrollCount = 0;
+      }
+
+      previousAdCount = collectedAds.length;
+    }
+
+    const ads = collectedAds.slice(0, limit);
+    diagnostics.push(await collectPageDiagnostics(page, 'v2-complete'));
+    diagnostics.push({ label: 'v2-final-network', total: networkLog.length, log: networkLog });
+
+    console.log(`[v2] Done: ${ads.length} ads, ${networkLog.length} API calls tracked`);
+    if (blockedRequests.length > 0) console.warn('[v2] Blocked:', blockedRequests);
+
+    return {
+      success: true,
+      ads,
+      totalFound: ads.length,
+      errors: [],
+      durationMs: Date.now() - startTime,
+      advertiserName,
+      diagnostics,
+      blockedRequests,
+      consoleErrors,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[v2] Failed: ${message}`);
+    return {
+      success: false,
+      ads: [],
+      totalFound: 0,
+      errors: [message],
+      durationMs: Date.now() - startTime,
+      advertiserName: null,
+      diagnostics,
+      blockedRequests,
+      consoleErrors,
+    };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+// --- Diagnose ---
+
+async function diagnose(facebookPageId: string): Promise<Record<string, unknown>> {
+  let browser: Browser | null = null;
+  const networkLog: (NetworkEntry & { size: number })[] = [];
+  const consoleMessages: { type: string; text: string }[] = [];
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+        '--disable-gpu', '--disable-blink-features=AutomationControlled',
+      ],
+    });
+
+    const context = await browser.newContext({
+      locale: 'en-US',
+      viewport: { width: 1440, height: 900 },
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      extraHTTPHeaders: {
+        'Accept-Language': 'en-US,en;q=0.9',
+        'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Linux"',
+      },
+    });
+
+    const page = await context.newPage();
+    await applyStealthScripts(page);
+
+    // Capture ALL console messages (not just errors)
+    page.on('console', msg => {
+      consoleMessages.push({ type: msg.type(), text: msg.text().substring(0, 500) });
+    });
+
+    // Capture ALL network responses
+    page.on('response', resp => {
+      networkLog.push({
+        url: resp.url().substring(0, 300),
+        status: resp.status(),
+        method: resp.request().method(),
+        type: resp.request().resourceType(),
+        size: Number(resp.headers()['content-length'] || 0),
+      });
+    });
+
+    const url = buildUrl(facebookPageId);
+    console.log('[diagnose] Loading page (networkidle)...');
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 60_000 });
+    await dismissCookieConsent(page);
+    await page.waitForTimeout(5_000);
+
+    const pageDiag = await collectPageDiagnostics(page, 'diagnose');
+
+    const jsState = await page.evaluate(() => {
+      const scripts = Array.from(document.querySelectorAll('script[src]'));
+      return {
+        totalScripts: scripts.length,
+        scriptSrcs: scripts.slice(0, 20).map(s => s.getAttribute('src')?.substring(0, 100) || ''),
+        hasFbJs: scripts.some(s => (s.getAttribute('src') || '').includes('rsrc.php')),
+        bodyClassCount: document.body.className.split(' ').length,
+        htmlLang: document.documentElement.lang,
+        metaViewport: document.querySelector('meta[name="viewport"]')?.getAttribute('content') || null,
+      };
+    });
+    console.log('[diagnose] JS state:', JSON.stringify(jsState));
+
+    // Test one scroll to see if the page responds
+    console.log('[diagnose] Testing scroll...');
+    const preScrollAds = await page.evaluate(() =>
+      document.querySelectorAll('div.x1plvlek.xryxfnj.x1gzqxud.x178xt8z.x1lun4ml').length
+    );
+    const preScrollHeight = await page.evaluate(() => document.body.scrollHeight);
+
+    await page.evaluate(() => window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }));
+    await page.waitForTimeout(5_000);
+
+    const postScrollAds = await page.evaluate(() =>
+      document.querySelectorAll('div.x1plvlek.xryxfnj.x1gzqxud.x178xt8z.x1lun4ml').length
+    );
+    const postScrollHeight = await page.evaluate(() => document.body.scrollHeight);
+
+    const scrollTest = {
+      preScrollAds,
+      postScrollAds,
+      preScrollHeight,
+      postScrollHeight,
+      newAdsLoaded: postScrollAds - preScrollAds,
+      heightGrew: postScrollHeight > preScrollHeight,
+      verdict: postScrollAds > preScrollAds ? 'INFINITE_SCROLL_WORKING' : 'INFINITE_SCROLL_BROKEN',
+    };
+    console.log('[diagnose] Scroll test:', JSON.stringify(scrollTest));
+
+    const screenshot = await page.screenshot({ type: 'jpeg', quality: 70, fullPage: false });
+
+    // Categorize network requests
+    const byType: Record<string, number> = {};
+    const byStatus: Record<number, number> = {};
+    for (const entry of networkLog) {
+      byType[entry.type] = (byType[entry.type] || 0) + 1;
+      byStatus[entry.status] = (byStatus[entry.status] || 0) + 1;
+    }
+
+    const fbApiCalls = networkLog.filter(e =>
+      e.url.includes('/api/graphql') || e.url.includes('/ajax/')
+    );
+
+    return {
+      pageDiagnostics: pageDiag,
+      scrollTest,
+      jsState,
+      networkSummary: { total: networkLog.length, byType, byStatus },
+      fbApiCalls,
+      consoleMessages: consoleMessages.slice(-50),
+      fullNetworkLog: networkLog,
+      screenshot: screenshot.toString('base64'),
+    };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
 // --- Express App ---
 
 const app = express();
@@ -416,6 +808,36 @@ app.post('/screenshot', async (req, res) => {
   try {
     const { screenshot, diagnostics } = await takeScreenshot(facebookPageId);
     res.json({ screenshot, diagnostics });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+app.post('/scrape-v2', async (req, res) => {
+  const { facebookPageId, adLimit } = req.body;
+  if (!facebookPageId || typeof facebookPageId !== 'string') {
+    res.status(400).json({ error: 'facebookPageId is required' });
+    return;
+  }
+
+  try {
+    const result = await scrapeV2(facebookPageId, adLimit ?? DEFAULT_ADS);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+app.post('/diagnose', async (req, res) => {
+  const { facebookPageId } = req.body;
+  if (!facebookPageId || typeof facebookPageId !== 'string') {
+    res.status(400).json({ error: 'facebookPageId is required' });
+    return;
+  }
+
+  try {
+    const result = await diagnose(facebookPageId);
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
